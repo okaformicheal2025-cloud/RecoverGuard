@@ -384,3 +384,34 @@
     none
   )
 )
+
+
+;; private functions
+
+(define-private (is-guardian (guardian principal) (guardians (list 5 principal)))
+  (is-some (index-of guardians guardian))
+)
+
+(define-private (has-approved (guardian principal) (vault-owner principal))
+  (default-to false 
+    (get approved (map-get? guardian-approvals 
+      { vault-owner: vault-owner, guardian: guardian })))
+)
+
+(define-private (is-guardian-self (guardians (list 5 principal)) (vault-owner principal))
+  (is-some (index-of guardians vault-owner))
+)
+
+(define-private (clear-guardian-approvals (vault-owner principal) (guardians (list 5 principal)))
+  (begin
+    (fold clear-single-approval guardians vault-owner)
+    true
+  )
+)
+
+(define-private (clear-single-approval (guardian principal) (vault-owner principal))
+  (begin
+    (map-delete guardian-approvals { vault-owner: vault-owner, guardian: guardian })
+    vault-owner
+  )
+)
