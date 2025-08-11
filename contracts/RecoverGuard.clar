@@ -208,7 +208,7 @@
     
     (map-set recovery-requests vault-owner {
       new-owner: new-owner,
-      initiated-at: block-height,
+      initiated-at: stacks-block-height,
       approvals: (list),
       approval-count: u0,
       is-active: true
@@ -236,7 +236,7 @@
     
     (map-set guardian-approvals 
       { vault-owner: vault-owner, guardian: guardian }
-      { approved: true, approved-at: block-height }
+      { approved: true, approved-at: stacks-block-height }
     )
     
     (let (
@@ -265,8 +265,8 @@
   )
     (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
     (asserts! (>= (get approval-count recovery-data) required-approvals) ERR_INSUFFICIENT_APPROVALS)
-    (asserts! (>= block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS)) ERR_RECOVERY_PERIOD_NOT_ENDED)
-    (asserts! (< block-height (+ (get initiated-at recovery-data) RECOVERY_EXPIRY_BLOCKS)) ERR_RECOVERY_EXPIRED)
+    (asserts! (>= stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS)) ERR_RECOVERY_PERIOD_NOT_ENDED)
+    (asserts! (< stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_EXPIRY_BLOCKS)) ERR_RECOVERY_EXPIRED)
     
     ;; Transfer STX balance to new owner
     (if (> stx-balance u0)
@@ -298,7 +298,7 @@
     (recovery-data (unwrap! (map-get? recovery-requests vault-owner) ERR_RECOVERY_NOT_INITIATED))
   )
     (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
-    (asserts! (< block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS CANCELLATION_PERIOD_BLOCKS)) ERR_RECOVERY_EXPIRED)
+    (asserts! (< stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS CANCELLATION_PERIOD_BLOCKS)) ERR_RECOVERY_EXPIRED)
     
     (map-delete recovery-requests vault-owner)
     (map-set vaults vault-owner 
@@ -335,5 +335,83 @@
     )
     
     (ok true)
+  )
+)
+
+
+;; read only functions
+
+(define-read-only (get-vault-info (vault-owner principal))
+  (map-get? vaults vault-owner)
+)
+
+(define-read-only (get-recovery-info (vault-owner principal))
+  (map-get? recovery-requests vault-owner)
+)
+
+(define-read-only (get-token-balance (vault-owner principal) (token-contract principal))
+  (default-to u0 (map-get? token-balances 
+    { vault-owner: vault-owner, token-contract: token-contract }))
+)
+
+(define-read-only (has-guardian-approved (vault-owner principal) (guardian principal))
+  (default-to false 
+    (get approved (map-get? guardian-approvals 
+      { vault-owner: vault-owner, guardian: guardian })))
+)
+
+(define-read-only (is-vault-owner (vault-owner principal))
+  (is-some (map-get? vaults vault-owner))
+)
+
+(define-read-only (get-recovery-status (vault-owner principal))
+  (match (map-get? recovery-requests vault-owner)
+    recovery-data (some {
+      new-owner: (get new-owner recovery-data),
+      initiated-at: (get initiated-at recovery-data),
+      approval-count: (get approval-count recovery-data),
+      is-active: (get is-active recovery-data),
+      can-execute: (and 
+        (get is-active recovery-data)
+        (>= stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS))
+        (< stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_EXPIRY_BLOCKS))
+      ),
+      time-remaining: (if (< stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS))
+        (some (- (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS) stacks-block-height))
+        none
+      )
+    })
+    none
+  )
+)
+
+
+;; private functions
+
+(define-private (is-guardian (guardian principal) (guardians (list 5 principal)))
+  (is-some (index-of guardians guardian))
+)
+
+(define-private (has-approved (guardian principal) (vault-owner principal))
+  (default-to false 
+    (get approved (map-get? guardian-approvals 
+      { vault-owner: vault-owner, guardian: guardian })))
+)
+
+(define-private (is-guardian-self (guardians (list 5 principal)) (vault-owner principal))
+  (is-some (index-of guardians vault-owner))
+)
+
+(define-private (clear-guardian-approvals (vault-owner principal) (guardians (list 5 principal)))
+  (begin
+    (fold clear-single-approval guardians vault-owner)
+    true
+  )
+)
+
+(define-private (clear-single-approval (guardian principal) (vault-owner principal))
+  (begin
+    (map-delete guardian-approvals { vault-owner: vault-owner, guardian: guardian })
+    vault-owner
   )
 )
