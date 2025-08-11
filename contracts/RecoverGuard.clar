@@ -337,3 +337,50 @@
     (ok true)
   )
 )
+
+
+;; read only functions
+
+(define-read-only (get-vault-info (vault-owner principal))
+  (map-get? vaults vault-owner)
+)
+
+(define-read-only (get-recovery-info (vault-owner principal))
+  (map-get? recovery-requests vault-owner)
+)
+
+(define-read-only (get-token-balance (vault-owner principal) (token-contract principal))
+  (default-to u0 (map-get? token-balances 
+    { vault-owner: vault-owner, token-contract: token-contract }))
+)
+
+(define-read-only (has-guardian-approved (vault-owner principal) (guardian principal))
+  (default-to false 
+    (get approved (map-get? guardian-approvals 
+      { vault-owner: vault-owner, guardian: guardian })))
+)
+
+(define-read-only (is-vault-owner (vault-owner principal))
+  (is-some (map-get? vaults vault-owner))
+)
+
+(define-read-only (get-recovery-status (vault-owner principal))
+  (match (map-get? recovery-requests vault-owner)
+    recovery-data (some {
+      new-owner: (get new-owner recovery-data),
+      initiated-at: (get initiated-at recovery-data),
+      approval-count: (get approval-count recovery-data),
+      is-active: (get is-active recovery-data),
+      can-execute: (and 
+        (get is-active recovery-data)
+        (>= block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS))
+        (< block-height (+ (get initiated-at recovery-data) RECOVERY_EXPIRY_BLOCKS))
+      ),
+      time-remaining: (if (< block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS))
+        (some (- (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS) block-height))
+        none
+      )
+    })
+    none
+  )
+)
