@@ -77,3 +77,263 @@
   { vault-owner: principal, token-contract: principal }
   uint
 )
+
+
+;; public functions
+
+;; Initialize a new vault with guardians
+(define-public (create-vault (guardians (list 5 principal)) (required-approvals uint))
+  (let (
+    (guardian-count (len guardians))
+    (vault-owner tx-sender)
+  )
+    (asserts! (>= guardian-count MIN_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (<= guardian-count MAX_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (<= required-approvals guardian-count) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (>= required-approvals (/ guardian-count u2)) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (is-none (map-get? vaults vault-owner)) ERR_GUARDIAN_ALREADY_EXISTS)
+    (asserts! (not (is-guardian-self guardians vault-owner)) ERR_CANNOT_BE_OWN_GUARDIAN)
+    
+    (map-set vaults vault-owner {
+      guardians: guardians,
+      required-approvals: required-approvals,
+      stx-balance: u0,
+      is-locked: false
+    })
+    
+    (ok true)
+  )
+)
+
+;; Deposit STX to vault
+(define-public (deposit-stx (amount uint))
+  (let (
+    (vault-owner tx-sender)
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set vaults vault-owner 
+      (merge vault-data { 
+        stx-balance: (+ (get stx-balance vault-data) amount) 
+      })
+    )
+    
+    (ok amount)
+  )
+)
+
+;; Withdraw STX from vault (owner only, when not in recovery)
+(define-public (withdraw-stx (amount uint))
+  (let (
+    (vault-owner tx-sender)
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (recovery-data (map-get? recovery-requests vault-owner))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get stx-balance vault-data) amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
+    (asserts! (is-none recovery-data) ERR_RECOVERY_ALREADY_INITIATED)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender vault-owner)))
+    
+    (map-set vaults vault-owner 
+      (merge vault-data { 
+        stx-balance: (- (get stx-balance vault-data) amount) 
+      })
+    )
+    
+    (ok amount)
+  )
+)
+
+;; Deposit SIP-010 tokens to vault
+(define-public (deposit-token (token-contract <sip-010-trait>) (amount uint))
+  (let (
+    (vault-owner tx-sender)
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (current-balance (default-to u0 (map-get? token-balances 
+      { vault-owner: vault-owner, token-contract: (contract-of token-contract) })))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
+    
+    (try! (contract-call? token-contract transfer amount tx-sender (as-contract tx-sender) none))
+    
+    (map-set token-balances 
+      { vault-owner: vault-owner, token-contract: (contract-of token-contract) }
+      (+ current-balance amount)
+    )
+    
+    (ok amount)
+  )
+)
+
+;; Withdraw SIP-010 tokens from vault (owner only, when not in recovery)
+(define-public (withdraw-token (token-contract <sip-010-trait>) (amount uint))
+  (let (
+    (vault-owner tx-sender)
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (recovery-data (map-get? recovery-requests vault-owner))
+    (current-balance (default-to u0 (map-get? token-balances 
+      { vault-owner: vault-owner, token-contract: (contract-of token-contract) })))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
+    (asserts! (is-none recovery-data) ERR_RECOVERY_ALREADY_INITIATED)
+    
+    (try! (as-contract (contract-call? token-contract transfer amount tx-sender vault-owner none)))
+    
+    (map-set token-balances 
+      { vault-owner: vault-owner, token-contract: (contract-of token-contract) }
+      (- current-balance amount)
+    )
+    
+    (ok amount)
+  )
+)
+
+;; Initiate recovery process
+(define-public (initiate-recovery (vault-owner principal) (new-owner principal))
+  (let (
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (guardians (get guardians vault-data))
+  )
+    (asserts! (is-guardian tx-sender guardians) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? recovery-requests vault-owner)) ERR_RECOVERY_ALREADY_INITIATED)
+    
+    (map-set recovery-requests vault-owner {
+      new-owner: new-owner,
+      initiated-at: block-height,
+      approvals: (list),
+      approval-count: u0,
+      is-active: true
+    })
+    
+    (map-set vaults vault-owner 
+      (merge vault-data { is-locked: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Guardian approves recovery
+(define-public (approve-recovery (vault-owner principal))
+  (let (
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (recovery-data (unwrap! (map-get? recovery-requests vault-owner) ERR_RECOVERY_NOT_INITIATED))
+    (guardians (get guardians vault-data))
+    (guardian tx-sender)
+  )
+    (asserts! (is-guardian guardian guardians) ERR_UNAUTHORIZED)
+    (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
+    (asserts! (not (has-approved guardian vault-owner)) ERR_GUARDIAN_ALREADY_EXISTS)
+    
+    (map-set guardian-approvals 
+      { vault-owner: vault-owner, guardian: guardian }
+      { approved: true, approved-at: block-height }
+    )
+    
+    (let (
+      (new-approvals (unwrap! (as-max-len? (append (get approvals recovery-data) guardian) u5) ERR_INVALID_GUARDIAN_COUNT))
+      (new-count (+ (get approval-count recovery-data) u1))
+    )
+      (map-set recovery-requests vault-owner 
+        (merge recovery-data {
+          approvals: new-approvals,
+          approval-count: new-count
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute recovery after delay and sufficient approvals
+(define-public (execute-recovery (vault-owner principal))
+  (let (
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (recovery-data (unwrap! (map-get? recovery-requests vault-owner) ERR_RECOVERY_NOT_INITIATED))
+    (required-approvals (get required-approvals vault-data))
+    (stx-balance (get stx-balance vault-data))
+  )
+    (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
+    (asserts! (>= (get approval-count recovery-data) required-approvals) ERR_INSUFFICIENT_APPROVALS)
+    (asserts! (>= block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS)) ERR_RECOVERY_PERIOD_NOT_ENDED)
+    (asserts! (< block-height (+ (get initiated-at recovery-data) RECOVERY_EXPIRY_BLOCKS)) ERR_RECOVERY_EXPIRED)
+    
+    ;; Transfer STX balance to new owner
+    (if (> stx-balance u0)
+      (try! (as-contract (stx-transfer? stx-balance tx-sender (get new-owner recovery-data))))
+      true
+    )
+    
+    ;; Update vault ownership
+    (map-set vaults (get new-owner recovery-data) 
+      (merge vault-data {
+        stx-balance: u0,
+        is-locked: false
+      })
+    )
+    
+    ;; Clean up old vault and recovery data
+    (map-delete vaults vault-owner)
+    (map-delete recovery-requests vault-owner)
+    
+    (ok (get new-owner recovery-data))
+  )
+)
+
+;; Cancel recovery (owner only, within cancellation period)
+(define-public (cancel-recovery)
+  (let (
+    (vault-owner tx-sender)
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (recovery-data (unwrap! (map-get? recovery-requests vault-owner) ERR_RECOVERY_NOT_INITIATED))
+  )
+    (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
+    (asserts! (< block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS CANCELLATION_PERIOD_BLOCKS)) ERR_RECOVERY_EXPIRED)
+    
+    (map-delete recovery-requests vault-owner)
+    (map-set vaults vault-owner 
+      (merge vault-data { is-locked: false })
+    )
+    
+    ;; Clear guardian approvals
+    (clear-guardian-approvals vault-owner (get guardians vault-data))
+    
+    (ok true)
+  )
+)
+
+;; Update guardians (owner only, when not in recovery)
+(define-public (update-guardians (new-guardians (list 5 principal)) (required-approvals uint))
+  (let (
+    (vault-owner tx-sender)
+    (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (guardian-count (len new-guardians))
+  )
+    (asserts! (>= guardian-count MIN_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (<= guardian-count MAX_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (<= required-approvals guardian-count) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (>= required-approvals (/ guardian-count u2)) ERR_INVALID_GUARDIAN_COUNT)
+    (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? recovery-requests vault-owner)) ERR_RECOVERY_ALREADY_INITIATED)
+    (asserts! (not (is-guardian-self new-guardians vault-owner)) ERR_CANNOT_BE_OWN_GUARDIAN)
+    
+    (map-set vaults vault-owner 
+      (merge vault-data {
+        guardians: new-guardians,
+        required-approvals: required-approvals
+      })
+    )
+    
+    (ok true)
+  )
+)
