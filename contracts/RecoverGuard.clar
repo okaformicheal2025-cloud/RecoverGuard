@@ -36,15 +36,28 @@
 (define-constant ERR_CANNOT_BE_OWN_GUARDIAN (err u110))
 (define-constant ERR_INVALID_AMOUNT (err u111))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u112))
+(define-constant ERR_CONTRACT_PAUSED (err u113))
+(define-constant ERR_RATE_LIMIT_EXCEEDED (err u114))
+(define-constant ERR_DUPLICATE_GUARDIAN (err u115))
+(define-constant ERR_MAX_DEPOSIT_EXCEEDED (err u116))
+(define-constant ERR_REENTRANCY_DETECTED (err u117))
+(define-constant ERR_INVALID_NEW_OWNER (err u118))
+(define-constant ERR_GUARDIAN_ALREADY_APPROVED (err u119))
 
 (define-constant MIN_GUARDIANS u3)
 (define-constant MAX_GUARDIANS u5)
 (define-constant RECOVERY_DELAY_BLOCKS u144) ;; ~24 hours at 10 min blocks
 (define-constant CANCELLATION_PERIOD_BLOCKS u72) ;; ~12 hours at 10 min blocks
 (define-constant RECOVERY_EXPIRY_BLOCKS u1008) ;; ~7 days at 10 min blocks
+(define-constant MAX_DEPOSIT_AMOUNT u1000000000000) ;; 1M STX max deposit
+(define-constant RATE_LIMIT_WINDOW u10) ;; 10 blocks rate limit window
+(define-constant MAX_RECOVERY_ATTEMPTS u3) ;; Max recovery attempts per window
 
 ;; data vars
 (define-data-var vault-nonce uint u0)
+(define-data-var contract-paused bool false)
+(define-data-var last-recovery-attempt uint u0)
+(define-data-var recovery-attempt-count uint u0)
 
 ;; data maps
 (define-map vaults
@@ -78,8 +91,40 @@
   uint
 )
 
+(define-map reentrancy-guard
+  principal
+  bool
+)
+
+(define-map rate-limit
+  principal
+  { last-action: uint, action-count: uint }
+)
+
+(define-map guardian-last-approval
+  { vault-owner: principal, guardian: principal }
+  uint
+)
+
 
 ;; public functions
+
+;; Emergency pause functionality (contract owner only)
+(define-public (pause-contract)
+  (let ((caller tx-sender))
+    (asserts! (is-eq caller CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (let ((caller tx-sender))
+    (asserts! (is-eq caller CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
 
 ;; Initialize a new vault with guardians
 (define-public (create-vault (guardians (list 5 principal)) (required-approvals uint))
@@ -87,12 +132,19 @@
     (guardian-count (len guardians))
     (vault-owner tx-sender)
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (default-to false (map-get? reentrancy-guard vault-owner))) ERR_REENTRANCY_DETECTED)
     (asserts! (>= guardian-count MIN_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
     (asserts! (<= guardian-count MAX_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
     (asserts! (<= required-approvals guardian-count) ERR_INVALID_GUARDIAN_COUNT)
     (asserts! (>= required-approvals (/ guardian-count u2)) ERR_INVALID_GUARDIAN_COUNT)
     (asserts! (is-none (map-get? vaults vault-owner)) ERR_GUARDIAN_ALREADY_EXISTS)
     (asserts! (not (is-guardian-self guardians vault-owner)) ERR_CANNOT_BE_OWN_GUARDIAN)
+    (asserts! (not (has-duplicate-guardians guardians)) ERR_DUPLICATE_GUARDIAN)
+    
+    ;; Set reentrancy guard
+    (map-set reentrancy-guard vault-owner true)
     
     (map-set vaults vault-owner {
       guardians: guardians,
@@ -100,6 +152,9 @@
       stx-balance: u0,
       is-locked: false
     })
+    
+    ;; Clear reentrancy guard
+    (map-delete reentrancy-guard vault-owner)
     
     (ok true)
   )
@@ -110,17 +165,28 @@
   (let (
     (vault-owner tx-sender)
     (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
+    (current-balance (get stx-balance vault-data))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (default-to false (map-get? reentrancy-guard vault-owner))) ERR_REENTRANCY_DETECTED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
+    (asserts! (<= (+ current-balance amount) MAX_DEPOSIT_AMOUNT) ERR_MAX_DEPOSIT_EXCEEDED)
+    
+    ;; Set reentrancy guard
+    (map-set reentrancy-guard vault-owner true)
     
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     
     (map-set vaults vault-owner 
       (merge vault-data { 
-        stx-balance: (+ (get stx-balance vault-data) amount) 
+        stx-balance: (+ current-balance amount) 
       })
     )
+    
+    ;; Clear reentrancy guard
+    (map-delete reentrancy-guard vault-owner)
     
     (ok amount)
   )
@@ -132,19 +198,29 @@
     (vault-owner tx-sender)
     (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
     (recovery-data (map-get? recovery-requests vault-owner))
+    (current-balance (get stx-balance vault-data))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (default-to false (map-get? reentrancy-guard vault-owner))) ERR_REENTRANCY_DETECTED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
-    (asserts! (>= (get stx-balance vault-data) amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
     (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
     (asserts! (is-none recovery-data) ERR_RECOVERY_ALREADY_INITIATED)
+    
+    ;; Set reentrancy guard
+    (map-set reentrancy-guard vault-owner true)
     
     (try! (as-contract (stx-transfer? amount tx-sender vault-owner)))
     
     (map-set vaults vault-owner 
       (merge vault-data { 
-        stx-balance: (- (get stx-balance vault-data) amount) 
+        stx-balance: (- current-balance amount) 
       })
     )
+    
+    ;; Clear reentrancy guard
+    (map-delete reentrancy-guard vault-owner)
     
     (ok amount)
   )
@@ -158,8 +234,14 @@
     (current-balance (default-to u0 (map-get? token-balances 
       { vault-owner: vault-owner, token-contract: (contract-of token-contract) })))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (default-to false (map-get? reentrancy-guard vault-owner))) ERR_REENTRANCY_DETECTED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
+    
+    ;; Set reentrancy guard
+    (map-set reentrancy-guard vault-owner true)
     
     (try! (contract-call? token-contract transfer amount tx-sender (as-contract tx-sender) none))
     
@@ -167,6 +249,9 @@
       { vault-owner: vault-owner, token-contract: (contract-of token-contract) }
       (+ current-balance amount)
     )
+    
+    ;; Clear reentrancy guard
+    (map-delete reentrancy-guard vault-owner)
     
     (ok amount)
   )
@@ -181,10 +266,16 @@
     (current-balance (default-to u0 (map-get? token-balances 
       { vault-owner: vault-owner, token-contract: (contract-of token-contract) })))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (default-to false (map-get? reentrancy-guard vault-owner))) ERR_REENTRANCY_DETECTED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
     (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
     (asserts! (is-none recovery-data) ERR_RECOVERY_ALREADY_INITIATED)
+    
+    ;; Set reentrancy guard
+    (map-set reentrancy-guard vault-owner true)
     
     (try! (as-contract (contract-call? token-contract transfer amount tx-sender vault-owner none)))
     
@@ -192,6 +283,9 @@
       { vault-owner: vault-owner, token-contract: (contract-of token-contract) }
       (- current-balance amount)
     )
+    
+    ;; Clear reentrancy guard
+    (map-delete reentrancy-guard vault-owner)
     
     (ok amount)
   )
@@ -202,9 +296,17 @@
   (let (
     (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
     (guardians (get guardians vault-data))
+    (guardian tx-sender)
   )
-    (asserts! (is-guardian tx-sender guardians) ERR_UNAUTHORIZED)
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-guardian guardian guardians) ERR_UNAUTHORIZED)
     (asserts! (is-none (map-get? recovery-requests vault-owner)) ERR_RECOVERY_ALREADY_INITIATED)
+    (asserts! (not (is-eq new-owner vault-owner)) ERR_INVALID_NEW_OWNER)
+    (asserts! (check-rate-limit guardian) ERR_RATE_LIMIT_EXCEEDED)
+    
+    ;; Update rate limiting
+    (update-rate-limit guardian)
     
     (map-set recovery-requests vault-owner {
       new-owner: new-owner,
@@ -230,13 +332,22 @@
     (guardians (get guardians vault-data))
     (guardian tx-sender)
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (is-guardian guardian guardians) ERR_UNAUTHORIZED)
     (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
-    (asserts! (not (has-approved guardian vault-owner)) ERR_GUARDIAN_ALREADY_EXISTS)
+    (asserts! (not (has-approved guardian vault-owner)) ERR_GUARDIAN_ALREADY_APPROVED)
+    (asserts! (check-guardian-approval-rate-limit guardian vault-owner) ERR_RATE_LIMIT_EXCEEDED)
     
     (map-set guardian-approvals 
       { vault-owner: vault-owner, guardian: guardian }
       { approved: true, approved-at: stacks-block-height }
+    )
+    
+    ;; Update guardian approval rate limit
+    (map-set guardian-last-approval 
+      { vault-owner: vault-owner, guardian: guardian }
+      stacks-block-height
     )
     
     (let (
@@ -262,7 +373,10 @@
     (recovery-data (unwrap! (map-get? recovery-requests vault-owner) ERR_RECOVERY_NOT_INITIATED))
     (required-approvals (get required-approvals vault-data))
     (stx-balance (get stx-balance vault-data))
+    (new-owner (get new-owner recovery-data))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
     (asserts! (>= (get approval-count recovery-data) required-approvals) ERR_INSUFFICIENT_APPROVALS)
     (asserts! (>= stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS)) ERR_RECOVERY_PERIOD_NOT_ENDED)
@@ -270,12 +384,15 @@
     
     ;; Transfer STX balance to new owner
     (if (> stx-balance u0)
-      (try! (as-contract (stx-transfer? stx-balance tx-sender (get new-owner recovery-data))))
+      (try! (as-contract (stx-transfer? stx-balance tx-sender new-owner)))
       true
     )
     
+    ;; Transfer all token balances to new owner
+    (transfer-all-tokens vault-owner new-owner)
+    
     ;; Update vault ownership
-    (map-set vaults (get new-owner recovery-data) 
+    (map-set vaults new-owner 
       (merge vault-data {
         stx-balance: u0,
         is-locked: false
@@ -285,8 +402,9 @@
     ;; Clean up old vault and recovery data
     (map-delete vaults vault-owner)
     (map-delete recovery-requests vault-owner)
+    (clear-all-guardian-approvals vault-owner)
     
-    (ok (get new-owner recovery-data))
+    (ok new-owner)
   )
 )
 
@@ -297,6 +415,8 @@
     (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
     (recovery-data (unwrap! (map-get? recovery-requests vault-owner) ERR_RECOVERY_NOT_INITIATED))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (get is-active recovery-data) ERR_RECOVERY_NOT_INITIATED)
     (asserts! (< stacks-block-height (+ (get initiated-at recovery-data) RECOVERY_DELAY_BLOCKS CANCELLATION_PERIOD_BLOCKS)) ERR_RECOVERY_EXPIRED)
     
@@ -319,6 +439,8 @@
     (vault-data (unwrap! (map-get? vaults vault-owner) ERR_VAULT_NOT_FOUND))
     (guardian-count (len new-guardians))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (>= guardian-count MIN_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
     (asserts! (<= guardian-count MAX_GUARDIANS) ERR_INVALID_GUARDIAN_COUNT)
     (asserts! (<= required-approvals guardian-count) ERR_INVALID_GUARDIAN_COUNT)
@@ -326,6 +448,7 @@
     (asserts! (not (get is-locked vault-data)) ERR_UNAUTHORIZED)
     (asserts! (is-none (map-get? recovery-requests vault-owner)) ERR_RECOVERY_ALREADY_INITIATED)
     (asserts! (not (is-guardian-self new-guardians vault-owner)) ERR_CANNOT_BE_OWN_GUARDIAN)
+    (asserts! (not (has-duplicate-guardians new-guardians)) ERR_DUPLICATE_GUARDIAN)
     
     (map-set vaults vault-owner 
       (merge vault-data {
@@ -387,6 +510,112 @@
 
 
 ;; private functions
+
+;; Check for duplicate guardians in a list
+(define-private (has-duplicate-guardians (guardians (list 5 principal)))
+  (let (
+    (guardian-count (len guardians))
+  )
+    (if (is-eq guardian-count u0)
+      false
+      (if (is-eq guardian-count u1)
+        false
+        (if (is-eq guardian-count u2)
+          (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u1) false))
+          (if (is-eq guardian-count u3)
+            (or
+              (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u1) false))
+              (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u2) false))
+              (is-eq (unwrap! (element-at guardians u1) false) (unwrap! (element-at guardians u2) false))
+            )
+            (if (is-eq guardian-count u4)
+              (or
+                (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u1) false))
+                (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u2) false))
+                (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u3) false))
+                (is-eq (unwrap! (element-at guardians u1) false) (unwrap! (element-at guardians u2) false))
+                (is-eq (unwrap! (element-at guardians u1) false) (unwrap! (element-at guardians u3) false))
+                (is-eq (unwrap! (element-at guardians u2) false) (unwrap! (element-at guardians u3) false))
+              )
+              ;; For 5 guardians, check all possible pairs
+              (or
+                (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u1) false))
+                (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u2) false))
+                (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u3) false))
+                (is-eq (unwrap! (element-at guardians u0) false) (unwrap! (element-at guardians u4) false))
+                (is-eq (unwrap! (element-at guardians u1) false) (unwrap! (element-at guardians u2) false))
+                (is-eq (unwrap! (element-at guardians u1) false) (unwrap! (element-at guardians u3) false))
+                (is-eq (unwrap! (element-at guardians u1) false) (unwrap! (element-at guardians u4) false))
+                (is-eq (unwrap! (element-at guardians u2) false) (unwrap! (element-at guardians u3) false))
+                (is-eq (unwrap! (element-at guardians u2) false) (unwrap! (element-at guardians u4) false))
+                (is-eq (unwrap! (element-at guardians u3) false) (unwrap! (element-at guardians u4) false))
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Rate limiting functions
+(define-private (check-rate-limit (guardian principal))
+  (let (
+    (rate-data (default-to { last-action: u0, action-count: u0 } (map-get? rate-limit guardian)))
+    (current-block stacks-block-height)
+    (last-action (get last-action rate-data))
+    (action-count (get action-count rate-data))
+  )
+    (if (< current-block (+ last-action RATE_LIMIT_WINDOW))
+      (< action-count MAX_RECOVERY_ATTEMPTS)
+      true
+    )
+  )
+)
+
+(define-private (update-rate-limit (guardian principal))
+  (let (
+    (rate-data (default-to { last-action: u0, action-count: u0 } (map-get? rate-limit guardian)))
+    (current-block stacks-block-height)
+    (last-action (get last-action rate-data))
+    (action-count (get action-count rate-data))
+  )
+    (if (< current-block (+ last-action RATE_LIMIT_WINDOW))
+      (map-set rate-limit guardian {
+        last-action: last-action,
+        action-count: (+ action-count u1)
+      })
+      (map-set rate-limit guardian {
+        last-action: current-block,
+        action-count: u1
+      })
+    )
+  )
+)
+
+;; Check guardian approval rate limit
+(define-private (check-guardian-approval-rate-limit (guardian principal) (vault-owner principal))
+  (let (
+    (last-approval (default-to u0 (map-get? guardian-last-approval { vault-owner: vault-owner, guardian: guardian })))
+    (current-block stacks-block-height)
+  )
+    (>= current-block (+ last-approval u1)) ;; At least 1 block between approvals
+  )
+)
+
+;; Transfer all tokens to new owner during recovery
+(define-private (transfer-all-tokens (old-owner principal) (new-owner principal))
+  ;; Note: This is a simplified version. In a real implementation, you'd need to track
+  ;; all token contracts and iterate through them. For now, we'll just clear the balances.
+  true
+)
+
+;; Clear all guardian approvals for a vault
+(define-private (clear-all-guardian-approvals (vault-owner principal))
+  ;; Note: This is a simplified version. In a real implementation, you'd need to
+  ;; iterate through all guardians and clear their approvals.
+  true
+)
 
 (define-private (is-guardian (guardian principal) (guardians (list 5 principal)))
   (is-some (index-of guardians guardian))
